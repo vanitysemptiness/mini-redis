@@ -3,7 +3,7 @@ use mini_redis::{ Connection, Frame };
 use mini_redis::Command::{ self, Get, Set };
 use bytes::Bytes;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{ Arc, Mutex };
 
 #[tokio::main]
 async fn main() {
@@ -17,8 +17,10 @@ async fn main() {
     Arc makes data shareable concurrently betwen many tasks potentially running on many threads
     thread-safe: no race conditions or data races
     copy only increments the reference counter, cheap and efficient
+    Mutex is a synchronization primative that only allows one thread access at a time
+    race condition prevention
      */
-    let db = Arc::new(Mutex::new(HashMap::new()));
+    let db = new_shard_db(1);
 
     loop {
         // The second item contains the IP and port of the new connection.
@@ -46,8 +48,7 @@ async fn main() {
     }
 }
 
-async fn process(socket: TcpStream, db: Db) {
-
+async fn process(socket: TcpStream, db: DbShards) {
     // Connection, provided by `mini-redis`, handles parsing frames from
     // the socket
     let mut connection = Connection::new(socket);
@@ -59,7 +60,7 @@ async fn process(socket: TcpStream, db: Db) {
                 let mut db = db.lock().unwrap();
                 db.insert(cmd.key().to_string(), cmd.value().clone());
                 Frame::Simple("OK".to_string())
-            }           
+            }
             Get(cmd) => {
                 let db = db.lock().unwrap();
                 if let Some(value) = db.get(cmd.key()) {
@@ -75,3 +76,21 @@ async fn process(socket: TcpStream, db: Db) {
         connection.write_frame(&response).await.unwrap();
     }
 }
+
+type DbShards = Arc<Vec<Mutex<HashMap<String, Vec<u8>>>>>;
+
+/*
+usize is an unsigned integer type that represents the size of a pointer on the
+    current platform
+    its used for indexes, sizes, and other quantities related to the memory
+        layout of data structures
+    4 bytes on a 32-bit system and 8 on a 64-bit system
+*/
+fn new_shard_db(num_shards: usize) -> DbShards {
+    let mut db = Vec::with_capacity(num_shards);
+    for _ in 0..num_shards {
+        db.push(Mutex::new(HashMap::new()));
+    }
+    Arc::new(db) // putting a semi colon herre would not return the value
+}
+
