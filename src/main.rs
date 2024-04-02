@@ -1,27 +1,77 @@
-use mini_redis::{client, Result};
+use tokio::net::{ TcpListener, TcpStream };
+use mini_redis::{ Connection, Frame };
+use mini_redis::Command::{ self, Get, Set };
+use bytes::Bytes;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() {
+    // Bind the listener to the address
+    let listener = TcpListener::bind("127.0.0.1:6379").await.unwrap();
+
+    println!("Listening");
+
     /*
-     * TCP connection established between running app and remote address.
-     * Remote address is IP address and port number,
-     * Transmission Control Protocol establishes reliable bidirectional communication
-     *  between two networked devices.
-     * 
-     * Code looks synchronous but is not, when we see await it is not sync
-     * When we make a sync operation the program execution is pauesed until completed
-     * 
-     * Calling an async fn returns a value representing the operation
-     * cenceptually analagous to a zero-argument closure
-     * 
-     * Rust converts an async fn into a routine that operates async at COMPILE TIME
-     * 
+    Arc is for Atomic Reference Counted
+    Arc makes data shareable concurrently betwen many tasks potentially running on many threads
+    thread-safe: no race conditions or data races
+    copy only increments the reference counter, cheap and efficient
      */
-    let mut client = client::connect("127.0.0.1:6379").await?;
-    client.set("hello", "world".into()).await?;
-    // get hello
-    let result = client.get("hello").await?;
-    println!("retrieved value from server result={:?}", result);
-    println!("Hello, world!");
-    Ok(())
+    let db = Arc::new(Mutex::new(HashMap::new()));
+
+    loop {
+        // The second item contains the IP and port of the new connection.
+        let (socket, _) = listener.accept().await.unwrap();
+
+        let db = db.clone();
+        // A new task is spawned for each inbound socket. The socket is
+        // moved to the new task and processed there.
+        /*
+        spawning the task subits it to the Tokio Scheduler
+        this ensures the task gets executed when it has work to do
+        spawned task may be executed on the same thread as where it was spawned
+            or it may execute on a different runtime thread
+        the task can be moved to different threads after being spawned
+        a Task on requires one allocation and 64 bytes of memory
+        apps should feel free to spawn millions of tasks if applicable
+        A Task cannot have references to any values outside the task
+        If a piece of data must be accessaible from more than one  task
+            concurrently then it must be shared using sycnchronization primatives
+            such as `Arc`
+         */
+        tokio::spawn(async move {
+            process(socket, db).await;
+        });
+    }
+}
+
+async fn process(socket: TcpStream, db: Db) {
+
+    // Connection, provided by `mini-redis`, handles parsing frames from
+    // the socket
+    let mut connection = Connection::new(socket);
+
+    // Use `read_frame` to receive a command from the connection.
+    while let Some(frame) = connection.read_frame().await.unwrap() {
+        let response = match Command::from_frame(frame).unwrap() {
+            Set(cmd) => {
+                let mut db = db.lock().unwrap();
+                db.insert(cmd.key().to_string(), cmd.value().clone());
+                Frame::Simple("OK".to_string())
+            }           
+            Get(cmd) => {
+                let db = db.lock().unwrap();
+                if let Some(value) = db.get(cmd.key()) {
+                    Frame::Bulk(value.clone())
+                } else {
+                    Frame::Null
+                }
+            }
+            cmd => panic!("unimplemented {:?}", cmd),
+        };
+
+        // Write the response to the client
+        connection.write_frame(&response).await.unwrap();
+    }
 }
